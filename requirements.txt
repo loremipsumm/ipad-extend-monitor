@@ -1,0 +1,11 @@
+flask
+flask-sock
+dxcam
+numpy
+simplejpeg
+av
+cryptography
+soundcard
+pystray
+pillow
+pyvirtualcam

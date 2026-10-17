@@ -1,0 +1,1000 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>iPad Extend</title>
+<style>
+  html, body { margin:0; padding:0; background:#000; overflow:hidden; height:100dvh; width:100%; }
+  #screen { width:100vw; height:100dvh; object-fit:contain; touch-action:none; -webkit-user-select:none; user-select:none; display:block; cursor:none; }
+  #menu-toggle {
+    position:fixed; right:10px; bottom:10px; z-index:10;
+    width:44px; height:44px; border-radius:22px;
+    background:rgba(255,255,255,0.25); color:#fff; font-size:20px;
+    display:flex; align-items:center; justify-content:center;
+    border:1px solid rgba(255,255,255,0.4);
+  }
+  #menu {
+    position:fixed; right:10px; bottom:62px; z-index:10;
+    display:flex; flex-direction:column; gap:6px;
+  }
+  #menu[hidden] { display:none; }
+  #menu button {
+    font:15px -apple-system, sans-serif; text-align:left;
+    padding:10px 14px; border-radius:10px; border:1px solid rgba(255,255,255,0.3);
+    background:rgba(30,30,30,0.92); color:#fff;
+  }
+  #kbd-bar {
+    position:fixed; left:0; right:0; bottom:0; z-index:10;
+    display:none; background:rgba(20,20,20,0.9); padding:8px;
+    box-sizing:border-box;
+  }
+  #kbd-bar.visible { display:flex; gap:8px; }
+  #kbd-input { flex:1; font-size:16px; padding:8px; border-radius:6px; border:none; }
+  #kbd-clear { padding:8px 12px; border-radius:6px; border:none; background:#555; color:#fff; }
+  #badge {
+    position:fixed; left:10px; top:10px; z-index:10; max-width:80vw;
+    padding:6px 10px; border-radius:6px; font:13px -apple-system, sans-serif;
+    background:rgba(0,0,0,0.7); color:#fff; transition:opacity 0.5s; opacity:0;
+  }
+  #badge a { color:#7cf; }
+  #stats {
+    position:fixed; right:10px; top:10px; z-index:10;
+    padding:6px 10px; border-radius:6px; font:12px ui-monospace, Menlo, monospace;
+    background:rgba(0,0,0,0.7); color:#9f9; white-space:pre;
+  }
+  #stats[hidden] { display:none; }
+  #cursor { position:fixed; left:0; top:0; z-index:5; pointer-events:none; display:none; will-change:transform; }
+  #cursor img { position:absolute; left:0; top:0; }
+  #cursor-inv { mix-blend-mode:difference; }
+  #cursor.dot { width:14px; height:14px; border-radius:7px; background:#fff; border:2px solid #000; box-sizing:border-box; }
+  #cam-preview {
+    position:fixed; left:10px; bottom:10px; z-index:10; width:160px; border-radius:8px;
+    border:2px solid rgba(255,255,255,0.6); background:#000;
+  }
+  #cam-preview[hidden] { display:none; }
+  #cam-preview.mirror { transform:scaleX(-1); }
+</style>
+</head>
+<body>
+  <canvas id="screen"></canvas>
+  <div id="cursor"><img id="cursor-img" alt=""><img id="cursor-inv" alt=""></div>
+  <div id="badge"></div>
+  <div id="stats" hidden></div>
+  <div id="menu" hidden>
+    <button id="btn-mode"></button>
+    <button id="btn-kbd">Keyboard layar</button>
+    <button id="btn-audio"></button>
+    <button id="btn-cam"></button>
+    <button id="btn-cam-flip"></button>
+    <button id="btn-clip">Kirim clipboard iPad &rarr; Windows</button>
+    <button id="btn-stats"></button>
+  </div>
+  <div id="menu-toggle">&#9776;</div>
+  <video id="cam-preview" playsinline muted hidden></video>
+  <div id="kbd-bar">
+    <textarea id="kbd-input" rows="1" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Ketik di sini..."></textarea>
+    <button id="kbd-clear">Clear</button>
+  </div>
+
+<script>
+const img = document.getElementById('screen');
+// desynchronized: browsers that support it show canvas updates without waiting for the page compositor.
+const ctx = img.getContext('2d', { alpha: false, desynchronized: true });
+const wsBase = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`;
+const HTTPS_PORT = {{ https_port }};
+const MODE_LABEL = { extend: 'Extend · monitor tambahan', duplicate: 'Duplicate · layar laptop' };
+let currentMode = {{ mode|tojson }};
+const PAGE_VERSION = {{ version|tojson }};
+
+// ------------------------------------------------------------ status badge (top left)
+
+const badgeEl = document.getElementById('badge');
+function showBadge(content, ms, html = false) {
+  badgeEl.style.whiteSpace = '';
+  if (html) badgeEl.innerHTML = content; else badgeEl.textContent = content;
+  badgeEl.style.opacity = '1';
+  clearTimeout(showBadge.timer);
+  showBadge.timer = setTimeout(() => { badgeEl.style.opacity = '0'; }, ms);
+}
+
+// ------------------------------------------------------------ stats overlay (top right)
+
+const statsEl = document.getElementById('stats');
+const stats = { frames: 0, bytes: 0, decodeMs: [], rtt: null, codec: '-', size: '-' };
+setInterval(() => {
+  if (!statsEl.hidden) {
+    const dec = stats.decodeMs.length
+      ? (stats.decodeMs.reduce((a, b) => a + b, 0) / stats.decodeMs.length).toFixed(1) + ' ms' : '-';
+    statsEl.textContent = [
+      `${stats.codec}  ${stats.size}`,
+      `fps      ${stats.frames}`,
+      `bitrate  ${(stats.bytes * 8 / 1e6).toFixed(1)} Mbit/s`,
+      `decode   ${dec}`,
+      `ping     ${stats.rtt === null ? '-' : stats.rtt.toFixed(0) + ' ms'}`,
+    ].join('\n');
+    sendInput({type:'ping', t: performance.now()});
+  }
+  stats.frames = 0;
+  stats.bytes = 0;
+  stats.decodeMs = [];
+}, 1000);
+
+// ------------------------------------------------------------ video
+
+function drawFrame(src, w, h) {
+  if (img.width !== w || img.height !== h) {
+    img.width = w;
+    img.height = h;
+    stats.size = `${w}x${h}`;
+    renderCursor();
+  }
+  ctx.drawImage(src, 0, 0);
+  stats.frames++;
+}
+
+function connectJpeg() {
+  stats.codec = 'JPEG';
+  const ws = new WebSocket(wsBase + '/ws/video');
+  ws.binaryType = 'arraybuffer';
+  ws.onmessage = async (ev) => {
+    stats.bytes += ev.data.byteLength;
+    const t0 = performance.now();
+    try {
+      const bmp = await createImageBitmap(new Blob([ev.data], { type: 'image/jpeg' }));
+      drawFrame(bmp, bmp.width, bmp.height);
+      bmp.close();
+      stats.decodeMs.push(performance.now() - t0);
+    } finally {
+      // Ack only after drawing so the server never has more than one frame in flight.
+      if (ws.readyState === WebSocket.OPEN) ws.send('a');
+    }
+  };
+  // The server also closes the stream on a mode switch, so reconnect quickly.
+  ws.onclose = () => setTimeout(connectJpeg, 300);
+}
+
+function connectH264() {
+  const ws = new WebSocket(wsBase + '/ws/h264');
+  ws.binaryType = 'arraybuffer';
+  let decoder = null;
+  let ts = 0;
+  const arrived = new Map(); // chunk timestamp -> arrival time, for the decode-time stat
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === 'string') {
+      const info = JSON.parse(ev.data);
+      decoder = new VideoDecoder({
+        output: (frame) => {
+          const t = arrived.get(frame.timestamp);
+          if (t !== undefined) {
+            stats.decodeMs.push(performance.now() - t);
+            arrived.delete(frame.timestamp);
+          }
+          drawFrame(frame, frame.displayWidth, frame.displayHeight);
+          frame.close();
+          if (ws.readyState === WebSocket.OPEN) ws.send('a');
+        },
+        // e.g. Safari reclaiming the decoder in the background: reconnect for a fresh keyframe
+        error: () => ws.close(),
+      });
+      decoder.configure({
+        codec: info.codec,
+        codedWidth: info.width,
+        codedHeight: info.height,
+        optimizeForLatency: true,
+      });
+      currentMode = info.mode;
+      stats.codec = `H.264 ${info.encoder}`;
+      showBadge(`H.264 · ${info.encoder} · ${MODE_LABEL[info.mode]}`, 3000);
+      updateMenu();
+      return;
+    }
+    stats.bytes += ev.data.byteLength;
+    const data = new Uint8Array(ev.data);
+    const timestamp = ts++;
+    arrived.set(timestamp, performance.now());
+    decoder.decode(new EncodedVideoChunk({
+      type: data[0] === 1 ? 'key' : 'delta',
+      timestamp,
+      data: data.subarray(1),
+    }));
+  };
+  ws.onclose = () => {
+    if (decoder && decoder.state !== 'closed') decoder.close();
+    setTimeout(connectH264, 300);
+  };
+}
+
+async function h264Supported() {
+  // WebCodecs only exists on secure (HTTPS) pages.
+  if (!window.isSecureContext || !('VideoDecoder' in window)) return false;
+  try {
+    const s = await VideoDecoder.isConfigSupported({
+      codec: 'avc1.640033', codedWidth: 2360, codedHeight: 1640, optimizeForLatency: true,
+    });
+    return s.supported;
+  } catch (e) {
+    return false;
+  }
+}
+
+h264Supported().then((ok) => {
+  if (ok) {
+    connectH264();
+    return;
+  }
+  connectJpeg();
+  const hdUrl = `https://${location.hostname}:${HTTPS_PORT}/`;
+  if (location.protocol === 'https:') {
+    showBadge('Mode JPEG (decoder H.264 tidak tersedia)', 8000);
+  } else {
+    showBadge(`Mode JPEG · <a href="${hdUrl}">buka mode H.264</a>`, 8000, true);
+  }
+});
+
+// ------------------------------------------------------------ input channel
+
+let inputWs = null;
+let pendingClipboard = null; // text copied in Windows, written to the iPad clipboard on the next tap
+
+function connectInput() {
+  inputWs = new WebSocket(wsBase + '/ws/input');
+  inputWs.onopen = () => reportOrientation(true);
+  inputWs.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if ('version' in msg && msg.version !== PAGE_VERSION) {
+      location.reload(); // the server has a newer page than the one running here
+      return;
+    }
+    if ('mode' in msg) {
+      const requested = currentMode;
+      currentMode = msg.mode;
+      updateMenu();
+      if (currentMode !== requested) {
+        showBadge('Extend tidak tersedia: set Windows ke "Extend these displays"', 6000);
+      } else {
+        reportOrientation(true);
+      }
+    }
+    if (msg.notice) showBadge(msg.notice, 6000);
+    if ('pong' in msg) stats.rtt = performance.now() - msg.pong;
+    if ('clipboard' in msg) pendingClipboard = msg.clipboard;
+    if ('cursor' in msg) onServerCursor(msg.cursor);
+    if (msg.cursor_shape) {
+      cursorShapes.set(msg.cursor_shape.id, msg.cursor_shape);
+      renderCursor();
+    }
+  };
+  inputWs.onclose = () => setTimeout(connectInput, 1000);
+}
+
+function sendInput(payload) {
+  if ('x' in payload) moveCursorLocally(payload);
+  if (inputWs && inputWs.readyState === WebSocket.OPEN) inputWs.send(JSON.stringify(payload));
+}
+
+// ------------------------------------------------------------ cursor, drawn here rather than in the video
+// so it follows the finger/trackpad instantly instead of after a network round trip.
+
+const cursorEl = document.getElementById('cursor');
+const cursorImg = document.getElementById('cursor-img');
+const cursorInv = document.getElementById('cursor-inv');
+const cursorShapes = new Map(); // shape id -> {w, h, hot, png, invert}
+const requestedShapes = new Set();
+const LOCAL_HOLD_MS = 500;      // after our own input, the server's (older) positions are ignored
+let cursorPos = null;           // {x, y} as fractions of the remote display, or null when hidden
+let cursorShapeId = null;
+let localUntil = 0;
+
+function moveCursorLocally(pos) {
+  cursorPos = { x: pos.x, y: pos.y };
+  localUntil = performance.now() + LOCAL_HOLD_MS;
+  renderCursor();
+}
+
+function onServerCursor(c) {
+  if (c && c.id) {
+    cursorShapeId = c.id;
+    if (!cursorShapes.has(c.id) && !requestedShapes.has(c.id)) {
+      requestedShapes.add(c.id);
+      sendInput({type:'cursor_shape', id: c.id});
+    }
+  }
+  if (performance.now() > localUntil) cursorPos = c ? { x: c.x, y: c.y } : null;
+  renderCursor();
+}
+
+function renderCursor() {
+  if (!cursorPos || !img.width) {
+    cursorEl.style.display = 'none';
+    return;
+  }
+  const box = getImageBox();
+  const scale = box.width / img.width; // remote pixels -> CSS pixels, same as the video
+  const px = box.left + cursorPos.x * box.width;
+  const py = box.top + cursorPos.y * box.height;
+  const shape = cursorShapes.get(cursorShapeId);
+  cursorEl.style.display = 'block';
+  if (!shape) {
+    cursorEl.classList.add('dot');
+    cursorImg.style.display = cursorInv.style.display = 'none';
+    cursorEl.style.transform = `translate(${px - 7}px, ${py - 7}px)`;
+    return;
+  }
+  cursorEl.classList.remove('dot');
+  for (const [el, src] of [[cursorImg, shape.png], [cursorInv, shape.invert]]) {
+    if (!src) {
+      el.style.display = 'none';
+      continue;
+    }
+    if (el.getAttribute('src') !== src) el.setAttribute('src', src);
+    el.style.width = `${shape.w * scale}px`;
+    el.style.height = `${shape.h * scale}px`;
+    el.style.display = '';
+  }
+  cursorEl.style.transform = `translate(${px - shape.hot[0] * scale}px, ${py - shape.hot[1] * scale}px)`;
+}
+
+window.addEventListener('resize', renderCursor);
+
+connectInput();
+
+// A tiny upstream message every 50 ms. Between packets the iPad puts its WiFi radio to sleep,
+// and the router then holds incoming video until the next wake-up (often 100+ ms); steady
+// traffic from the iPad keeps the radio awake.
+setInterval(() => { if (!document.hidden) sendInput({type:'hb'}); }, 50);
+
+// Things Safari only allows inside a tap or key press.
+function onUserGesture() {
+  requestWakeLock();
+  if (pendingClipboard !== null && navigator.clipboard) {
+    const text = pendingClipboard;
+    pendingClipboard = null;
+    navigator.clipboard.writeText(text).then(() => showBadge('Clipboard Windows disalin ke iPad', 2000), () => {});
+  }
+}
+
+// ------------------------------------------------------------ keep the iPad screen on
+
+let wakeLock = null;
+async function requestWakeLock() {
+  if (!('wakeLock' in navigator) || (wakeLock && !wakeLock.released)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+  } catch (e) {
+    // not allowed right now (e.g. page hidden); retried on the next tap
+  }
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) requestWakeLock(); });
+
+// ------------------------------------------------------------ rotate the virtual monitor with the iPad
+
+let reportedPortrait = null;
+function reportOrientation(force = false) {
+  if (currentMode !== 'extend') return;
+  const portrait = innerHeight > innerWidth;
+  if (!force && portrait === reportedPortrait) return;
+  reportedPortrait = portrait;
+  sendInput({type:'orientation', portrait});
+}
+window.addEventListener('resize', () => {
+  clearTimeout(reportOrientation.timer);
+  reportOrientation.timer = setTimeout(reportOrientation, 400); // resize fires repeatedly while rotating
+});
+
+// ------------------------------------------------------------ coordinates
+
+function getImageBox() {
+  const rect = img.getBoundingClientRect();
+  const iw = img.width || rect.width;
+  const ih = img.height || rect.height;
+  const imgAspect = iw / ih;
+  const rectAspect = rect.width / rect.height;
+  let dispW, dispH, offX, offY;
+  if (imgAspect > rectAspect) {
+    dispW = rect.width;
+    dispH = rect.width / imgAspect;
+    offX = 0;
+    offY = (rect.height - dispH) / 2;
+  } else {
+    dispH = rect.height;
+    dispW = rect.height * imgAspect;
+    offY = 0;
+    offX = (rect.width - dispW) / 2;
+  }
+  return { left: rect.left + offX, top: rect.top + offY, width: dispW, height: dispH };
+}
+
+function normalize(clientX, clientY) {
+  const box = getImageBox();
+  let nx = (clientX - box.left) / box.width;
+  let ny = (clientY - box.top) / box.height;
+  nx = Math.min(1, Math.max(0, nx));
+  ny = Math.min(1, Math.max(0, ny));
+  return [nx, ny];
+}
+
+function point(clientX, clientY) {
+  const [x, y] = normalize(clientX, clientY);
+  return { x, y };
+}
+
+function click(button, pos) {
+  sendInput({type:'down', button, ...pos});
+  sendInput({type:'up', button, ...pos});
+}
+
+// ------------------------------------------------------------ finger gestures
+// One finger: tap = click, drag = drag, hold = right click, quick double tap = double click.
+// Two fingers: pan = scroll (content follows the fingers, like on the iPad), pinch = zoom
+// (Ctrl+wheel), tap = right click. Apple Pencil touches are handled by the pen code below.
+
+const TAP_SLOP = 10;        // px a finger may drift and still count as a tap or hold
+const HOLD_MS = 550;
+const TWO_FINGER_TAP_MS = 300;
+const DOUBLE_TAP_MS = 400;
+const DOUBLE_TAP_PX = 30;
+const SCROLL_SCALE = 6;     // wheel units per px of finger movement
+const ZOOM_PX_PER_STEP = 40;
+let gesture = null;
+let lastTap = null;
+
+const fingers = (list) => [...list].filter((t) => t.touchType !== 'stylus');
+const midpoint = (a, b) => [(a.clientX + b.clientX) / 2, (a.clientY + b.clientY) / 2];
+const spread = (a, b) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+
+img.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  menu.hidden = true;
+  const touches = fingers(e.touches);
+  if (!touches.length) return;
+  if (touches.length === 1 && !gesture) {
+    const t = touches[0];
+    gesture = { kind: 'one', x0: t.clientX, y0: t.clientY, pos: point(t.clientX, t.clientY), dragging: false, held: false };
+    sendInput({type:'move', ...gesture.pos});
+    gesture.holdTimer = setTimeout(() => {
+      if (gesture && gesture.kind === 'one' && !gesture.dragging) {
+        gesture.held = true;
+        click('right', gesture.pos);
+      }
+    }, HOLD_MS);
+  } else if (touches.length >= 2) {
+    if (gesture && gesture.kind === 'one') {
+      clearTimeout(gesture.holdTimer);
+      if (gesture.dragging) sendInput({type:'up', button:'left', ...gesture.pos});
+    }
+    const [mx, my] = midpoint(touches[0], touches[1]);
+    const d = spread(touches[0], touches[1]);
+    gesture = { kind: 'two', t0: performance.now(), mx0: mx, my0: my, d0: d, mx, my, d, mode: null, zoomAcc: 0, pos: point(mx, my) };
+  }
+}, {passive:false});
+
+img.addEventListener('touchmove', (e) => {
+  e.preventDefault();
+  const touches = fingers(e.touches);
+  if (!gesture) return;
+  if (gesture.kind === 'one' && touches.length === 1) {
+    const t = touches[0];
+    if (!gesture.dragging && !gesture.held && Math.hypot(t.clientX - gesture.x0, t.clientY - gesture.y0) > TAP_SLOP) {
+      clearTimeout(gesture.holdTimer);
+      gesture.dragging = true;
+      sendInput({type:'down', button:'left', ...gesture.pos}); // press where the finger landed
+    }
+    if (gesture.dragging) {
+      gesture.pos = point(t.clientX, t.clientY);
+      sendInput({type:'move', ...gesture.pos});
+    }
+  } else if (gesture.kind === 'two' && touches.length >= 2) {
+    const [mx, my] = midpoint(touches[0], touches[1]);
+    const d = spread(touches[0], touches[1]);
+    if (!gesture.mode) {
+      const panned = Math.hypot(mx - gesture.mx0, my - gesture.my0);
+      const pinched = Math.abs(d - gesture.d0);
+      if (Math.max(panned, pinched) > TAP_SLOP) gesture.mode = pinched > panned ? 'zoom' : 'scroll';
+    }
+    if (gesture.mode === 'scroll') {
+      // Windows wheel > 0 scrolls up, i.e. content moves down: the same way the fingers moved.
+      const dy = Math.round((my - gesture.my) * SCROLL_SCALE);
+      const dx = Math.round((gesture.mx - mx) * SCROLL_SCALE);
+      if (dy) sendInput({type:'wheel', delta: dy});
+      if (dx) sendInput({type:'hwheel', delta: dx});
+    } else if (gesture.mode === 'zoom') {
+      // Apps zoom one step per wheel event, so only send whole 120-unit notches.
+      gesture.zoomAcc += d - gesture.d;
+      while (Math.abs(gesture.zoomAcc) >= ZOOM_PX_PER_STEP) {
+        const dir = Math.sign(gesture.zoomAcc);
+        sendInput({type:'wheel', delta: 120 * dir, ctrl: true});
+        gesture.zoomAcc -= dir * ZOOM_PX_PER_STEP;
+      }
+    }
+    gesture.mx = mx;
+    gesture.my = my;
+    gesture.d = d;
+  }
+}, {passive:false});
+
+img.addEventListener('touchend', (e) => {
+  e.preventDefault();
+  onUserGesture();
+  if (!gesture || fingers(e.touches).length) return;
+  if (gesture.kind === 'one') {
+    clearTimeout(gesture.holdTimer);
+    if (gesture.dragging) {
+      sendInput({type:'up', button:'left', ...gesture.pos});
+    } else if (!gesture.held) {
+      // Land a quick second tap exactly on the first, so Windows sees a double-click.
+      const now = performance.now();
+      if (lastTap && now - lastTap.time < DOUBLE_TAP_MS
+          && Math.hypot(gesture.x0 - lastTap.x, gesture.y0 - lastTap.y) < DOUBLE_TAP_PX) {
+        gesture.pos = lastTap.pos;
+        sendInput({type:'move', ...gesture.pos});
+      }
+      click('left', gesture.pos);
+      lastTap = { time: now, x: gesture.x0, y: gesture.y0, pos: gesture.pos };
+    }
+  } else if (!gesture.mode && performance.now() - gesture.t0 < TWO_FINGER_TAP_MS) {
+    click('right', gesture.pos);
+  }
+  gesture = null;
+}, {passive:false});
+
+img.addEventListener('touchcancel', () => {
+  if (gesture && gesture.kind === 'one') {
+    clearTimeout(gesture.holdTimer);
+    if (gesture.dragging) sendInput({type:'up', button:'left', ...gesture.pos});
+  }
+  gesture = null;
+});
+
+// ------------------------------------------------------------ trackpad & Apple Pencil
+// iPad reports the Magic Keyboard trackpad as pointerType 'mouse' and the Pencil as 'pen'.
+
+let lastPointerType = 'touch';
+let wheelAccX = 0, wheelAccY = 0;
+const WHEEL_SCALE = 2;
+let penDown = false;
+
+const pointerPos = (e) => point(e.clientX, e.clientY);
+
+function penMessage(phase, e) {
+  return {
+    type: 'pen', phase, ...pointerPos(e),
+    pressure: e.pressure, tiltX: e.tiltX || 0, tiltY: e.tiltY || 0,
+  };
+}
+
+img.addEventListener('pointermove', (e) => {
+  lastPointerType = e.pointerType;
+  if (e.pointerType === 'mouse') {
+    sendInput({type:'move', ...pointerPos(e)});
+  } else if (e.pointerType === 'pen') {
+    // Coalesced events carry every Pencil sample (up to 240 Hz) for smooth strokes.
+    const samples = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+    for (const s of (samples.length ? samples : [e])) sendInput(penMessage(penDown ? 'move' : 'hover', s));
+  }
+});
+
+// Keep receiving moves while dragging outside the canvas (best effort; never blocks the input).
+function capture(e) {
+  try { img.setPointerCapture(e.pointerId); } catch (err) { /* pointer already gone */ }
+}
+
+img.addEventListener('pointerdown', (e) => {
+  lastPointerType = e.pointerType;
+  if (e.pointerType === 'pen') {
+    menu.hidden = true;
+    penDown = true;
+    sendInput(penMessage('down', e));
+    capture(e);
+    return;
+  }
+  if (e.pointerType !== 'mouse' || e.button !== 0) return;
+  menu.hidden = true;
+  altAlone = false;
+  syncModifiers(e); // e.g. Shift+click, Option+click
+  sendInput({type:'down', button:'left', ...pointerPos(e)});
+  capture(e);
+});
+
+img.addEventListener('pointerup', (e) => {
+  if (e.pointerType === 'pen') {
+    penDown = false;
+    sendInput(penMessage('up', e));
+    onUserGesture();
+    return;
+  }
+  if (e.pointerType !== 'mouse' || e.button !== 0) return;
+  sendInput({type:'up', button:'left', ...pointerPos(e)});
+  onUserGesture();
+});
+
+img.addEventListener('pointercancel', (e) => {
+  if (e.pointerType === 'pen' && penDown) {
+    penDown = false;
+    sendInput(penMessage('up', e));
+  }
+});
+
+// Two-finger click on the trackpad arrives as a contextmenu event.
+img.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  if (lastPointerType !== 'mouse') return;
+  click('right', pointerPos(e));
+});
+
+img.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  if (e.ctrlKey) return; // pinch gesture, not scrolling
+  const px = e.deltaMode === 1 ? 40 : 1; // line-based deltas -> pixels
+  // Browser deltaY > 0 means scroll down; Windows wheel delta > 0 means scroll up.
+  wheelAccY += -e.deltaY * px * WHEEL_SCALE;
+  wheelAccX += e.deltaX * px * WHEEL_SCALE;
+  const dy = Math.trunc(wheelAccY), dx = Math.trunc(wheelAccX);
+  if (dy) { sendInput({type:'wheel', delta: dy}); wheelAccY -= dy; }
+  if (dx) { sendInput({type:'hwheel', delta: dx}); wheelAccX -= dx; }
+}, {passive:false});
+
+// ------------------------------------------------------------ menu
+
+const menu = document.getElementById('menu');
+const btnMode = document.getElementById('btn-mode');
+const btnAudio = document.getElementById('btn-audio');
+const btnStats = document.getElementById('btn-stats');
+
+function updateMenu() {
+  btnMode.textContent = `Mode: ${currentMode === 'extend' ? 'Extend' : 'Duplicate'} (ketuk untuk ganti)`;
+  btnAudio.textContent = `Audio laptop: ${audioOn ? 'nyala' : 'mati'}`;
+  btnCam.textContent = `Kamera iPad → webcam Windows: ${CAM_LABEL[camState]}`;
+  btnCamFlip.textContent = `Putar kamera 180°: ${camFlip ? 'nyala' : 'mati'}`;
+  btnStats.textContent = `Statistik: ${statsEl.hidden ? 'mati' : 'nyala'}`;
+}
+
+document.getElementById('menu-toggle').addEventListener('click', () => {
+  menu.hidden = !menu.hidden;
+  updateMenu();
+  onUserGesture();
+});
+
+btnMode.addEventListener('click', () => {
+  if (!inputWs || inputWs.readyState !== WebSocket.OPEN) return;
+  currentMode = currentMode === 'extend' ? 'duplicate' : 'extend';
+  sendInput({type:'mode', mode: currentMode});
+  showBadge(MODE_LABEL[currentMode], 3000);
+  updateMenu();
+});
+
+document.getElementById('btn-kbd').addEventListener('click', () => {
+  menu.hidden = true;
+  kbdBar.classList.toggle('visible');
+  if (kbdBar.classList.contains('visible')) kbdInput.focus();
+});
+
+btnAudio.addEventListener('click', () => {
+  toggleAudio();
+  updateMenu();
+});
+
+document.getElementById('btn-clip').addEventListener('click', async () => {
+  menu.hidden = true;
+  try {
+    const text = await navigator.clipboard.readText(); // Safari asks for permission with a "Paste" bubble
+    sendInput({type:'clipboard', text});
+    showBadge('Clipboard iPad dikirim ke Windows. Tekan Cmd+V untuk paste.', 3000);
+  } catch (e) {
+    showBadge('Clipboard iPad tidak bisa dibaca', 3000);
+  }
+});
+
+btnStats.addEventListener('click', () => {
+  statsEl.hidden = !statsEl.hidden;
+  updateMenu();
+});
+
+// ------------------------------------------------------------ audio from the laptop
+// 16-bit stereo PCM at 48 kHz in 20 ms chunks, scheduled slightly ahead to absorb jitter.
+
+const AUDIO_RATE = 48000;
+const AUDIO_LEAD = 0.08;
+let audioCtx = null, audioWs = null, audioOn = false, audioNext = 0;
+
+function toggleAudio() {
+  audioOn = !audioOn;
+  if (audioOn) {
+    // Must be created/resumed inside a tap or iOS keeps it silent.
+    audioCtx = audioCtx || new AudioContext({ sampleRate: AUDIO_RATE });
+    audioCtx.resume();
+    connectAudio();
+  } else {
+    if (audioWs) audioWs.close();
+    if (audioCtx) audioCtx.suspend();
+  }
+}
+
+function connectAudio() {
+  audioWs = new WebSocket(wsBase + '/ws/audio');
+  audioWs.binaryType = 'arraybuffer';
+  audioWs.onmessage = (ev) => playPcm(new Int16Array(ev.data));
+  audioWs.onclose = () => { if (audioOn) setTimeout(() => { if (audioOn) connectAudio(); }, 1000); };
+}
+
+function playPcm(pcm) {
+  const frames = pcm.length / 2;
+  const buffer = audioCtx.createBuffer(2, frames, AUDIO_RATE);
+  const left = buffer.getChannelData(0);
+  const right = buffer.getChannelData(1);
+  for (let i = 0; i < frames; i++) {
+    left[i] = pcm[2 * i] / 32768;
+    right[i] = pcm[2 * i + 1] / 32768;
+  }
+  const now = audioCtx.currentTime;
+  // Re-sync after a gap, or when the queue has drifted too far behind real time.
+  if (audioNext < now + 0.02 || audioNext > now + 0.3) audioNext = now + AUDIO_LEAD;
+  const src = audioCtx.createBufferSource();
+  src.buffer = buffer;
+  src.connect(audioCtx.destination);
+  src.start(audioNext);
+  audioNext += buffer.duration;
+}
+
+// ------------------------------------------------------------ iPad camera -> Windows webcam
+// The camera is encoded to H.264 here (hardware, via WebCodecs) and the laptop feeds it to the
+// OBS Virtual Camera. Frames are dropped rather than queued if WiFi or the encoder falls behind.
+
+const btnCam = document.getElementById('btn-cam');
+const camVideo = document.getElementById('cam-preview');
+const CAM_LABEL = { off: 'mati', user: 'kamera depan', environment: 'kamera belakang' };
+const NEXT_CAM = { off: 'user', user: 'environment', environment: 'off' };
+const CAM_KEYFRAME_EVERY = 60; // ~2 s, so a dropped chunk heals quickly
+// Manual override from the menu, remembered on this iPad, in case a camera still arrives upside down.
+let camFlip = false;
+try { camFlip = localStorage.getItem('camFlip') === '1'; } catch (e) { /* storage unavailable */ }
+const camCanvas = document.createElement('canvas');
+const camCtx = camCanvas.getContext('2d', { alpha: false });
+let camState = 'off';
+let camStream = null, camWs = null, camEncoder = null, camSize = '', camFrames = 0;
+
+btnCam.addEventListener('click', () => setCamera(NEXT_CAM[camState]));
+
+const btnCamFlip = document.getElementById('btn-cam-flip');
+btnCamFlip.addEventListener('click', () => {
+  camFlip = !camFlip;
+  try { localStorage.setItem('camFlip', camFlip ? '1' : '0'); } catch (e) { /* storage unavailable */ }
+  updateMenu();
+});
+
+function stopCamera() {
+  if (camWs) {
+    camWs.onclose = camWs.onmessage = null; // closing on purpose: don't treat it as a failure
+    camWs.close();
+    camWs = null;
+  }
+  if (camEncoder && camEncoder.state !== 'closed') camEncoder.close();
+  camEncoder = null;
+  camSize = '';
+  if (camStream) camStream.getTracks().forEach((t) => t.stop());
+  camStream = null;
+  camVideo.srcObject = null;
+  camVideo.hidden = true;
+}
+
+async function setCamera(next) {
+  stopCamera();
+  camState = next;
+  updateMenu();
+  if (next === 'off') return;
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: next, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+      audio: false,
+    });
+  } catch (e) {
+    showBadge(`Kamera tidak bisa dibuka: ${e.message}`, 5000);
+    camState = 'off';
+    updateMenu();
+    return;
+  }
+  camStream.getVideoTracks()[0].onended = () => {
+    if (camState === 'off') return;
+    showBadge('Kamera iPad berhenti', 3000);
+    setCamera('off');
+  };
+  camVideo.srcObject = camStream;
+  camVideo.classList.toggle('mirror', next === 'user'); // only the preview is mirrored
+  camVideo.hidden = false;
+  await camVideo.play();
+  camWs = new WebSocket(wsBase + '/ws/camera');
+  camWs.binaryType = 'arraybuffer';
+  camWs.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.error) {
+      showBadge(msg.error, 6000);
+      setCamera('off');
+    } else if (msg.ok) {
+      showBadge(`Kamera iPad aktif di Windows sebagai "${msg.ok}"`, 4000);
+      camVideo.requestVideoFrameCallback(onCameraFrame);
+    }
+  };
+  camWs.onclose = () => {
+    showBadge('Koneksi kamera terputus', 3000);
+    setCamera('off');
+  };
+}
+
+function onCameraFrame() {
+  if (!camEncoder && !camStream) return; // stopped
+  const w = camVideo.videoWidth, h = camVideo.videoHeight;
+  if (w && h && camWs && camWs.readyState === WebSocket.OPEN) {
+    if (camSize !== `${w}x${h}`) {
+      // First frame, or the iPad rotated (the camera image swaps width/height).
+      if (camEncoder && camEncoder.state !== 'closed') camEncoder.close();
+      camEncoder = new VideoEncoder({
+        output: (chunk) => {
+          const data = new Uint8Array(chunk.byteLength);
+          chunk.copyTo(data);
+          if (camWs && camWs.readyState === WebSocket.OPEN) camWs.send(data);
+        },
+        error: (e) => {
+          showBadge(`Encoder kamera gagal: ${e.message}`, 5000);
+          setCamera('off');
+        },
+      });
+      camEncoder.configure({
+        codec: 'avc1.420028', // Baseline, level 4.0: up to 1080p30
+        width: w, height: h, bitrate: 3_000_000, framerate: 30,
+        latencyMode: 'realtime', avc: { format: 'annexb' },
+      });
+      camSize = `${w}x${h}`;
+      camFrames = 0;
+    }
+    if (camEncoder.encodeQueueSize < 2 && camWs.bufferedAmount < 512 * 1024) {
+      // A VideoFrame taken straight from the <video> holds the raw sensor image plus a rotation
+      // that the encoder ignores (the picture came out sideways/upside down). Drawing through a
+      // canvas applies the rotation exactly as Safari shows the preview.
+      if (camCanvas.width !== w || camCanvas.height !== h) {
+        camCanvas.width = w;
+        camCanvas.height = h;
+      }
+      if (camFlip) {
+        camCtx.setTransform(-1, 0, 0, -1, w, h); // rotate 180° about the centre
+      }
+      camCtx.drawImage(camVideo, 0, 0, w, h);
+      camCtx.setTransform(1, 0, 0, 1, 0, 0);
+      const frame = new VideoFrame(camCanvas, { timestamp: Math.round(performance.now() * 1000) });
+      camEncoder.encode(frame, { keyFrame: camFrames % CAM_KEYFRAME_EVERY === 0 });
+      frame.close();
+      camFrames++;
+    }
+  }
+  if (camStream) camVideo.requestVideoFrameCallback(onCameraFrame);
+}
+
+updateMenu();
+
+// ------------------------------------------------------------ on-screen keyboard bar
+
+const kbdBar = document.getElementById('kbd-bar');
+const kbdInput = document.getElementById('kbd-input');
+document.getElementById('kbd-clear').addEventListener('click', () => { kbdInput.value = ''; kbdInput.focus(); });
+
+kbdInput.addEventListener('beforeinput', (e) => {
+  if (e.inputType === 'insertText' || e.inputType === 'insertCompositionText') {
+    for (const ch of (e.data || '')) sendInput({type:'char', char: ch});
+  } else if (e.inputType === 'insertLineBreak') {
+    sendInput({type:'key', name:'Enter'});
+  } else if (e.inputType === 'deleteContentBackward') {
+    sendInput({type:'key', name:'Backspace'});
+  }
+});
+
+// ------------------------------------------------------------ hardware keyboard (Magic Keyboard)
+// Physical keys are forwarded; the server maps them to scan codes.
+
+const pressedKeys = new Set();
+const MODIFIERS = [
+  ['shiftKey', ['ShiftLeft', 'ShiftRight']],
+  ['ctrlKey', ['ControlLeft', 'ControlRight']],
+  ['metaKey', ['MetaLeft', 'MetaRight']], // the server maps Cmd to Ctrl
+  ['altKey', ['AltLeft', 'AltRight']],
+];
+const MODIFIER_CODES = new Set(MODIFIERS.flatMap(([, codes]) => codes));
+const ALT_CODES = ['AltLeft', 'AltRight'];
+let altAlone = false; // Option is down and nothing has been pressed with it yet
+
+function press(code, extra = {}) {
+  pressedKeys.add(code);
+  sendInput({type:'keydown', code, ...extra});
+}
+
+function release(code) {
+  pressedKeys.delete(code);
+  sendInput({type:'keyup', code});
+  // Safari fires no keyup for keys released while Cmd is held, so release those along with Cmd.
+  if (code === 'MetaLeft' || code === 'MetaRight') releaseKeys((c) => !MODIFIER_CODES.has(c));
+}
+
+function releaseKeys(shouldRelease) {
+  [...pressedKeys].filter(shouldRelease).forEach(release);
+}
+
+// Safari on iPad doesn't reliably send events for the modifier keys themselves, but every key,
+// click and scroll event carries the modifier flags: make Windows' modifiers match them.
+function syncModifiers(e) {
+  for (const [flag, codes] of MODIFIERS) {
+    const down = codes.filter((c) => pressedKeys.has(c));
+    if (e[flag] && !down.length) press(codes[0]);
+    if (!e[flag]) down.forEach(release);
+  }
+}
+
+// Open the page with ?debug to see the last key events Safari actually delivered.
+const DEBUG_KEYS = new URLSearchParams(location.search).has('debug');
+const debugLines = [];
+function debugKey(e) {
+  if (!DEBUG_KEYS) return;
+  debugLines.push(`${e.type} code=${e.code || '-'} alt=${e.altKey} meta=${e.metaKey} shift=${e.shiftKey}`);
+  debugLines.splice(0, debugLines.length - 6);
+  showBadge('', 8000);
+  badgeEl.style.whiteSpace = 'pre';
+  badgeEl.textContent = debugLines.join('\n');
+}
+
+document.addEventListener('keydown', (e) => {
+  debugKey(e);
+  onUserGesture();
+  if (e.target === kbdInput || !e.code) return; // the on-screen text bar handles its own input
+  e.preventDefault(); // stop Safari from scrolling, moving focus, etc.
+  if (MODIFIER_CODES.has(e.code)) {
+    // Option is held back: for Option+Z no Alt may reach Windows (a lone Alt press/release
+    // would activate the app's menu instead of leaving Start open).
+    if (ALT_CODES.includes(e.code)) {
+      if (!e.repeat && !pressedKeys.has(e.code)) altAlone = true;
+    } else if (!pressedKeys.has(e.code)) {
+      press(e.code);
+    }
+    return;
+  }
+  altAlone = false;
+  if (e.code === 'CapsLock') {
+    sendInput({type:'caps', on: e.getModifierState('CapsLock')});
+    return;
+  }
+  // The iPad has no Windows key and iPadOS keeps Globe to itself, so Option+Z opens Start.
+  if (e.code === 'KeyZ' && e.altKey && !ALT_CODES.some((c) => pressedKeys.has(c))) {
+    sendInput({type:'start'});
+    return; // Z itself is never pressed, so its keyup is ignored
+  }
+  syncModifiers(e);
+  press(e.code, {caps: e.getModifierState('CapsLock')});
+});
+
+document.addEventListener('keyup', (e) => {
+  debugKey(e);
+  if (e.target === kbdInput) return;
+  if (e.code === 'CapsLock') {
+    sendInput({type:'caps', on: e.getModifierState('CapsLock')});
+    return;
+  }
+  if (ALT_CODES.includes(e.code) && altAlone) {
+    // Option pressed and released on its own: a plain Alt tap
+    altAlone = false;
+    sendInput({type:'keydown', code: e.code});
+    sendInput({type:'keyup', code: e.code});
+    return;
+  }
+  if (pressedKeys.has(e.code)) release(e.code);
+  // Release modifiers that were let go without their own keyup reaching us.
+  for (const [flag, codes] of MODIFIERS) {
+    if (!e[flag]) codes.filter((c) => pressedKeys.has(c)).forEach(release);
+  }
+});
+
+// Never leave keys stuck down on Windows when the page loses focus.
+window.addEventListener('blur', () => {
+  altAlone = false;
+  releaseKeys(() => true);
+});
+document.addEventListener('visibilitychange', () => { if (document.hidden) releaseKeys(() => true); });
+</script>
+</body>
+</html>

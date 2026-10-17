@@ -1,0 +1,9 @@
+# Local certificate authority + server key (private keys trusted by the iPad: never commit)
+certs/
+
+# Per-machine runtime files
+state.json
+server.log
+
+__pycache__/
+*.pyc

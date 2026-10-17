@@ -1,0 +1,8 @@
+{
+  "extend_display": null,
+  "auto_rotate": true,
+  "port": 5000,
+  "https_port": 5001,
+  "h264_quality": 23,
+  "jpeg_quality": 70
+}
